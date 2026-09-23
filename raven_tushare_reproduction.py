@@ -37,14 +37,14 @@ Quick start:
     4. Full run:
        python raven_tushare_reproduction.py --mode all
 
-The default paper-style split is:
-    train: 2009-01-01 to 2019-12-31
-    test : 2020-01-01 to 2024-12-31
+The default local study split is:
+    train: 2023-01-01 to 2024-12-31
+    valid: 2025-01-01 to 2025-12-31
+    test : 2026-01-01 to 2026-12-31
 
-An optional validation split can be enabled from the Config class by setting
-VALID_START and VALID_END. The paper reports fixed-epoch training and does not
-specify a separate validation protocol, so the default does not use validation
-for model selection.
+The 2026 test interval is evaluated only over dates returned by Tushare, so it
+is a partial-year out-of-sample period until the year is complete. Future-horizon
+boundary samples are purged so labels do not cross train/valid/test splits.
 """
 
 from __future__ import annotations
@@ -68,10 +68,10 @@ import torch.nn as nn
 
 
 # ============================================================================
-# 0. USER CONFIGURATION: CHANGE YOUR TOKEN HERE
+# 0. USER CONFIGURATION: READ TOKEN FROM LOCAL ENVIRONMENT
 # ============================================================================
 
-TUSHARE_TOKEN = "110799e57830654a754280e52bd0472ebfc81aedd94dadca3d5284e4"
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 
 
 @dataclass
@@ -79,15 +79,14 @@ class Config:
     # ---- Data source ----
     tushare_token: str = TUSHARE_TOKEN
     index_code: str = "000300.SH"
-    start_date: str = "20090101"
-    end_date: str = "20241231"
-    train_start: str = "20090101"
-    train_end: str = "20191231"
-    test_start: str = "20200101"
-    test_end: str = "20241231"
-    # Optional validation. Keep None for the paper-style fixed-epoch split.
-    valid_start: Optional[str] = None
-    valid_end: Optional[str] = None
+    start_date: str = "20230101"
+    end_date: str = "20261231"
+    train_start: str = "20230101"
+    train_end: str = "20241231"
+    valid_start: Optional[str] = "20250101"
+    valid_end: Optional[str] = "20251231"
+    test_start: str = "20260101"
+    test_end: str = "20261231"
     min_listing_days: int = 180
     exclude_st: bool = True
     download_daily_basic: bool = False
@@ -160,7 +159,7 @@ class Config:
     def validate(self) -> None:
         if not self.tushare_token or "在这里" in self.tushare_token:
             raise ValueError(
-                "请先在脚本最上方 TUSHARE_TOKEN = \"...\" 中填入你的 Tushare Token。"
+                "请先在本地环境变量 TUSHARE_TOKEN 中填入你的 Tushare Token。"
             )
         if self.num_experts != len(self.thresholds):
             raise ValueError("num_experts 必须等于 thresholds 的数量。")
@@ -757,18 +756,37 @@ def split_indices(
             x_window = block.X[end_idx - lookback + 1 : end_idx + 1]
             if not np.isfinite(y) or not np.isfinite(x_window).all():
                 continue
+
+            # Purge samples whose future-horizon label crosses a split
+            # boundary. The target is formed with a row-based horizon within
+            # each stock block, so use the corresponding future observation
+            # date rather than a calendar-day approximation.
+            future_idx = end_idx + cfg.forecast_horizon
+            if future_idx >= len(block.dates):
+                continue
+            future_date = pd.Timestamp(block.dates[future_idx])
             sample = SampleIndex(block_id, end_idx)
-            # The paper-style split uses all 2009-2019 observations for
-            # training. An optional validation split can be enabled explicitly.
-            if valid_start is not None and valid_end is not None and valid_start <= date <= valid_end:
+
+            if (
+                valid_start is not None
+                and valid_end is not None
+                and valid_start <= date <= valid_end
+                and future_date <= valid_end
+            ):
                 valid_indices.append(sample)
-            elif train_start <= date <= train_end:
+            elif (
+                train_start <= date <= train_end
+                and future_date <= train_end
+            ):
                 train_indices.append(sample)
                 train_targets.append(y)
-            elif test_start <= date <= test_end:
+            elif (
+                test_start <= date <= test_end
+                and future_date <= test_end
+            ):
                 test_indices.append(sample)
 
-    if not train_indices or not test_indices:
+    if not train_indices or not valid_indices or not test_indices:
         raise RuntimeError(
             f"样本切分为空: train={len(train_indices)}, valid={len(valid_indices)}, test={len(test_indices)}。"
         )

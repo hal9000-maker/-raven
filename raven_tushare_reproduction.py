@@ -29,7 +29,7 @@ Important:
     private preprocessing can be recovered exactly.
 
 Quick start:
-    1. Replace TUSHARE_TOKEN near the top of this file.
+    1. Set the local environment variable TUSHARE_TOKEN before running.
     2. Install dependencies:
        pip install tushare pandas numpy torch scikit-learn tqdm
     3. Debug with a small universe:

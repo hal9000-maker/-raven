@@ -71,7 +71,7 @@ import torch.nn as nn
 # 0. USER CONFIGURATION: CHANGE YOUR TOKEN HERE
 # ============================================================================
 
-TUSHARE_TOKEN = "在这里粘贴你的Tushare Token"
+TUSHARE_TOKEN = "110799e57830654a754280e52bd0472ebfc81aedd94dadca3d5284e4"
 
 
 @dataclass

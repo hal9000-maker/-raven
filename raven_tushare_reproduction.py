@@ -72,6 +72,7 @@ import torch.nn as nn
 # ============================================================================
 
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+FEATURE_CACHE_VERSION = 2
 
 
 @dataclass
@@ -124,6 +125,13 @@ class Config:
     num_workers: int = 0
     grad_clip: float = 1.0
     device: str = "auto"
+    early_stopping_patience: int = 10
+    early_stopping_min_delta: float = 1e-4
+    selection_metric: str = "valid_rankic"
+
+    # ---- Feature normalization ----
+    cross_sectional_normalize: bool = True
+    winsorize_quantile: float = 0.01
 
     # ---- Portfolio evaluation ----
     rebalance_every: int = 10
@@ -169,6 +177,37 @@ class Config:
             raise ValueError("thresholds 必须递增。")
         if self.patch_len <= 0 or self.max_lookback < self.patch_len:
             raise ValueError("max_lookback 必须不小于 patch_len。")
+        if self.early_stopping_patience < 1:
+            raise ValueError("early_stopping_patience 至少为 1。")
+        if self.early_stopping_min_delta < 0:
+            raise ValueError("early_stopping_min_delta 不能为负。")
+        if self.selection_metric not in {"valid_loss", "valid_rankic"}:
+            raise ValueError("selection_metric 只能是 valid_loss 或 valid_rankic。")
+        if not 0.0 <= self.winsorize_quantile < 0.5:
+            raise ValueError("winsorize_quantile 必须位于 [0, 0.5)。")
+
+        train_start = pd.Timestamp(self.train_start)
+        train_end = pd.Timestamp(self.train_end)
+        valid_start = pd.Timestamp(self.valid_start) if self.valid_start else None
+        valid_end = pd.Timestamp(self.valid_end) if self.valid_end else None
+        test_start = pd.Timestamp(self.test_start)
+        test_end = pd.Timestamp(self.test_end)
+        if train_start > train_end or test_start > test_end:
+            raise ValueError("训练集和测试集起止日期不合法。")
+        if valid_start is None or valid_end is None:
+            raise ValueError("当前训练流程要求显式设置验证集日期。")
+        if valid_start > valid_end or not (train_end < valid_start <= valid_end < test_start):
+            raise ValueError("时间切分必须满足 train < valid < test，且各区间不能重叠。")
+
+        data_start = pd.Timestamp(self.start_date)
+        data_end = pd.Timestamp(self.end_date)
+        if data_start > data_end:
+            raise ValueError("数据下载起止日期不合法。")
+        if data_start > train_start or data_end < test_end:
+            raise ValueError(
+                "下载日期必须覆盖完整的 train / valid / test 区间；"
+                "请检查 start_date、end_date 与切分日期。"
+            )
 
 
 # ============================================================================
@@ -200,6 +239,69 @@ def save_json(obj: Dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+
+
+def load_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cache_request(cfg: Config) -> Dict[str, Any]:
+    """Fields that determine whether raw and processed caches are reusable."""
+    return {
+        "index_code": cfg.index_code,
+        "start_date": cfg.start_date,
+        "end_date": cfg.end_date,
+        "max_stocks": cfg.max_stocks,
+        "download_daily_basic": cfg.download_daily_basic,
+    }
+
+
+def raw_cache_matches(cfg: Config) -> bool:
+    """Return True only when the raw cache was built for this exact request."""
+    manifest_path = cfg.raw_dir / "download_manifest.json"
+    daily_path = cfg.raw_dir / "daily_all.pkl"
+    if cfg.force_download or not manifest_path.exists() or not daily_path.exists():
+        return False
+    try:
+        manifest = load_json(manifest_path)
+    except (OSError, ValueError, TypeError):
+        return False
+    return all(manifest.get(key) == value for key, value in cache_request(cfg).items())
+
+
+def feature_cache_matches(cfg: Config) -> bool:
+    manifest_path = cfg.processed_dir / "feature_manifest.json"
+    if not manifest_path.exists() or not raw_cache_matches(cfg):
+        return False
+    try:
+        manifest = load_json(manifest_path)
+    except (OSError, ValueError, TypeError):
+        return False
+    expected = {
+        **cache_request(cfg),
+        "feature_cache_version": FEATURE_CACHE_VERSION,
+        "cross_sectional_normalize": cfg.cross_sectional_normalize,
+        "winsorize_quantile": cfg.winsorize_quantile,
+        "forecast_horizon": cfg.forecast_horizon,
+    }
+    return all(manifest.get(key) == value for key, value in expected.items())
+
+
+def date_coverage(frame: pd.DataFrame, date_col: str = "trade_date") -> Dict[str, Any]:
+    """Small, serializable coverage summary used in logs and run metadata."""
+    if frame.empty or date_col not in frame.columns:
+        return {"rows": int(len(frame)), "first_date": None, "last_date": None, "n_dates": 0}
+    dates = pd.to_datetime(frame[date_col], errors="coerce").dropna()
+    if dates.empty:
+        return {"rows": int(len(frame)), "first_date": None, "last_date": None, "n_dates": 0}
+    return {
+        "rows": int(len(frame)),
+        "first_date": str(dates.min().date()),
+        "last_date": str(dates.max().date()),
+        "n_dates": int(dates.nunique()),
+        "n_stocks": int(frame["ts_code"].nunique()) if "ts_code" in frame.columns else None,
+    }
 
 
 def date_to_str(value: Any) -> str:
@@ -420,20 +522,6 @@ def download_market_data(cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         codes = codes[: cfg.max_stocks]
     print(f"[download] universe size = {len(codes)}")
 
-    # Cache a compact manifest so a later run can inspect the exact universe.
-    save_json(
-        {
-            "index_code": cfg.index_code,
-            "start_date": cfg.start_date,
-            "end_date": cfg.end_date,
-            "codes": codes,
-            "historical_membership_available": bool(
-                members.get("historical_membership_available", pd.Series([False])).iloc[0]
-            ),
-        },
-        cfg.raw_dir / "download_manifest.json",
-    )
-
     all_daily: List[pd.DataFrame] = []
     for n, code in enumerate(codes, start=1):
         try:
@@ -468,6 +556,22 @@ def download_market_data(cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     daily.to_pickle(cfg.raw_dir / "daily_all.pkl")
     if not basic_all.empty:
         basic_all.to_pickle(cfg.raw_dir / "daily_basic_all.pkl")
+
+    # Write this only after download finishes.  The old script wrote the
+    # manifest before fetching data and could later mistake stale files for a
+    # complete cache after the requested date range changed.
+    manifest = {
+        **cache_request(cfg),
+        "codes": codes,
+        "n_codes_requested": len(codes),
+        "historical_membership_available": bool(
+            members.get("historical_membership_available", pd.Series([False])).iloc[0]
+        ),
+        "actual_coverage": date_coverage(daily),
+        "downloaded_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    save_json(manifest, cfg.raw_dir / "download_manifest.json")
+    print(f"[download] actual coverage = {manifest['actual_coverage']}")
     return daily, stock_basic if basic_all.empty else stock_basic
 
 
@@ -616,11 +720,53 @@ def construct_factors(cleaned: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame,
     return factors, factor_cols
 
 
+def cross_sectional_normalize_factors(
+    factors: pd.DataFrame,
+    factor_cols: List[str],
+    cfg: Config,
+) -> pd.DataFrame:
+    """Winsorize and z-score each factor within a trading date.
+
+    At date t this uses only the cross-section observable after that day's
+    close. It therefore improves scale comparability without looking ahead.
+    """
+    if not cfg.cross_sectional_normalize:
+        return factors
+
+    result = factors.copy()
+    q = cfg.winsorize_quantile
+    for _, index in result.groupby("trade_date", sort=False).groups.items():
+        values = result.loc[index, factor_cols]
+        lower = values.quantile(q)
+        upper = values.quantile(1.0 - q)
+        clipped = values.clip(lower=lower, upper=upper, axis=1)
+        mean = clipped.mean(axis=0)
+        std = clipped.std(axis=0, ddof=0).replace(0.0, np.nan)
+        normalized = (clipped - mean) / std
+        # A constant factor carries no cross-sectional information that day.
+        # Preserve genuine missing values: replacing those with zero would make
+        # an immature rolling factor look like a valid observation and let it
+        # enter the training samples too early.
+        constant_cols = std[std.isna()].index.tolist()
+        if constant_cols:
+            normalized.loc[:, constant_cols] = normalized.loc[:, constant_cols].where(
+                clipped.loc[:, constant_cols].isna(), 0.0
+            )
+        result.loc[index, factor_cols] = normalized.where(clipped.notna())
+    return result
+
+
 def prepare_features(cfg: Config) -> Tuple[pd.DataFrame, List[str]]:
     ensure_dirs(cfg)
     feature_path = cfg.processed_dir / "features.pkl"
     names_path = cfg.processed_dir / "feature_names.json"
-    if feature_path.exists() and names_path.exists() and not cfg.force_rebuild_features:
+    if (
+        feature_path.exists()
+        and names_path.exists()
+        and not cfg.force_rebuild_features
+        and not cfg.force_download
+        and feature_cache_matches(cfg)
+    ):
         factors = pd.read_pickle(feature_path)
         with names_path.open("r", encoding="utf-8") as f:
             factor_cols = json.load(f)
@@ -628,13 +774,13 @@ def prepare_features(cfg: Config) -> Tuple[pd.DataFrame, List[str]]:
 
     daily_path = cfg.raw_dir / "daily_all.pkl"
     basic_path = cfg.raw_dir / "stock_basic.pkl"
-    if not daily_path.exists() or not basic_path.exists():
+    if cfg.force_download or not raw_cache_matches(cfg) or not basic_path.exists():
         download_market_data(cfg)
     daily = pd.read_pickle(daily_path)
     stock_basic = pd.read_pickle(basic_path)
     cleaned = clean_daily_data(daily, stock_basic, cfg)
     daily_basic_path = cfg.raw_dir / "daily_basic_all.pkl"
-    if daily_basic_path.exists():
+    if cfg.download_daily_basic and daily_basic_path.exists():
         daily_basic = pd.read_pickle(daily_basic_path).copy()
         daily_basic["trade_date"] = pd.to_datetime(
             daily_basic["trade_date"], format="%Y%m%d", errors="coerce"
@@ -658,10 +804,24 @@ def prepare_features(cfg: Config) -> Tuple[pd.DataFrame, List[str]]:
             how="left",
         )
     cleaned.to_pickle(cfg.processed_dir / "cleaned_daily.pkl")
+    cleaned_coverage = date_coverage(cleaned)
+    print(f"[data] cleaned coverage = {cleaned_coverage}")
     factors, factor_cols = construct_factors(cleaned, cfg)
+    factors = cross_sectional_normalize_factors(factors, factor_cols, cfg)
     factors.to_pickle(feature_path)
     save_json({"feature_names": factor_cols}, names_path)
-    print(f"[features] rows={len(factors):,}, factors={len(factor_cols)}")
+    save_json(
+        {
+            **cache_request(cfg),
+            "feature_cache_version": FEATURE_CACHE_VERSION,
+            "cross_sectional_normalize": cfg.cross_sectional_normalize,
+            "winsorize_quantile": cfg.winsorize_quantile,
+            "forecast_horizon": cfg.forecast_horizon,
+            "actual_coverage": date_coverage(factors),
+        },
+        cfg.processed_dir / "feature_manifest.json",
+    )
+    print(f"[features] rows={len(factors):,}, factors={len(factor_cols)}, coverage={date_coverage(factors)}")
     return factors, factor_cols
 
 
@@ -748,6 +908,7 @@ def split_indices(
     test_end = pd.Timestamp(cfg.test_end)
     valid_start = pd.Timestamp(cfg.valid_start) if cfg.valid_start else None
     valid_end = pd.Timestamp(cfg.valid_end) if cfg.valid_end else None
+    observed_dates = np.concatenate([block.dates for block in blocks]) if blocks else np.asarray([])
 
     for block_id, block in enumerate(blocks):
         for end_idx in range(lookback - 1, len(block.dates)):
@@ -787,8 +948,17 @@ def split_indices(
                 test_indices.append(sample)
 
     if not train_indices or not valid_indices or not test_indices:
+        observed_start = str(pd.Timestamp(observed_dates.min()).date()) if len(observed_dates) else "None"
+        observed_end = str(pd.Timestamp(observed_dates.max()).date()) if len(observed_dates) else "None"
         raise RuntimeError(
-            f"样本切分为空: train={len(train_indices)}, valid={len(valid_indices)}, test={len(test_indices)}。"
+            "样本切分为空: "
+            f"train={len(train_indices)}, valid={len(valid_indices)}, test={len(test_indices)}。"
+            f"因子数据实际覆盖 {observed_start} 至 {observed_end}；"
+            f"请求切分为 train[{cfg.train_start},{cfg.train_end}]、"
+            f"valid[{cfg.valid_start},{cfg.valid_end}]、"
+            f"test[{cfg.test_start},{cfg.test_end}]。"
+            "请先确认 Tushare 返回了相应年份的数据；若改过日期范围，使用 "
+            "--force-download --force-rebuild-features 重新构建缓存。"
         )
     target_mean = float(np.mean(train_targets))
     target_std = float(np.std(train_targets) + 1e-8)
@@ -797,6 +967,22 @@ def split_indices(
         f"test={len(test_indices):,}, target_mean={target_mean:.6g}, target_std={target_std:.6g}"
     )
     return train_indices, valid_indices, test_indices, target_mean, target_std
+
+
+def summarize_split(
+    blocks: List[StockBlock],
+    indices: List[SampleIndex],
+) -> Dict[str, Any]:
+    if not indices:
+        return {"n_samples": 0, "n_stocks": 0, "first_date": None, "last_date": None}
+    dates = [pd.Timestamp(blocks[item.block_id].dates[item.end_idx]) for item in indices]
+    codes = {blocks[item.block_id].ts_code for item in indices}
+    return {
+        "n_samples": len(indices),
+        "n_stocks": len(codes),
+        "first_date": str(min(dates).date()),
+        "last_date": str(max(dates).date()),
+    }
 
 
 def collate_raven(batch):
@@ -1106,6 +1292,20 @@ def evaluate_predictions(predictions: pd.DataFrame) -> Dict[str, float]:
     return metrics
 
 
+def validation_selection_score(
+    cfg: Config,
+    valid_stats: Dict[str, float],
+    valid_metrics: Dict[str, float],
+) -> Tuple[float, str]:
+    """Return a score where larger is better and the metric actually used."""
+    if cfg.selection_metric == "valid_rankic":
+        rankic = valid_metrics.get("mean_rankic", float("nan"))
+        if np.isfinite(rankic):
+            return float(rankic), "valid_rankic"
+        warnings.warn("验证集 RankIC 不可用，当前轮回退为按验证损失选择模型。")
+    return -float(valid_stats["loss"]), "valid_loss"
+
+
 def simple_topk_backtest(predictions: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """A transparent top-K backtest using the paper's 10-day rebalance idea.
 
@@ -1179,12 +1379,18 @@ def train_and_evaluate(
 
     blocks = build_blocks(factors, factor_cols)
     train_idx, valid_idx, test_idx, target_mean, target_std = split_indices(blocks, cfg)
+    split_summary = {
+        "train": summarize_split(blocks, train_idx),
+        "valid": summarize_split(blocks, valid_idx),
+        "test": summarize_split(blocks, test_idx),
+    }
+    print(f"[split detail] {json.dumps(split_summary, ensure_ascii=False)}")
     train_ds = RavenSequenceDataset(blocks, train_idx, cfg.effective_lookback, target_mean, target_std)
-    valid_ds = RavenSequenceDataset(blocks, valid_idx, cfg.effective_lookback, target_mean, target_std) if valid_idx else None
+    valid_ds = RavenSequenceDataset(blocks, valid_idx, cfg.effective_lookback, target_mean, target_std)
     test_ds = RavenSequenceDataset(blocks, test_idx, cfg.effective_lookback, target_mean, target_std)
 
     train_loader = make_loader(train_ds, cfg, shuffle=True)
-    valid_loader = make_loader(valid_ds, cfg, shuffle=False) if valid_ds is not None else None
+    valid_loader = make_loader(valid_ds, cfg, shuffle=False)
     test_loader = make_loader(test_ds, cfg, shuffle=False)
 
     model = RAVEN(num_channels=len(factor_cols), cfg=cfg).to(device)
@@ -1192,25 +1398,49 @@ def train_and_evaluate(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
 
     best_state = None
-    best_valid_loss = float("inf")
+    best_score = -float("inf")
+    best_epoch = 0
+    best_metric_used = cfg.selection_metric
+    epochs_without_improvement = 0
     history: List[Dict[str, Any]] = []
     for epoch in range(1, cfg.epochs + 1):
         train_stats = run_epoch(model, train_loader, optimizer, device, cfg, train=True)
-        valid_stats = run_epoch(model, valid_loader, None, device, cfg, train=False) if valid_loader else {}
+        valid_stats = run_epoch(model, valid_loader, None, device, cfg, train=False)
+        valid_predictions = predict(model, valid_loader, device, target_mean, target_std)
+        valid_metrics = evaluate_predictions(valid_predictions)
+        selection_score, metric_used = validation_selection_score(cfg, valid_stats, valid_metrics)
         scheduler.step()
-        record = {"epoch": epoch, "lr": scheduler.get_last_lr()[0], "train": train_stats, "valid": valid_stats}
+        record = {
+            "epoch": epoch,
+            "lr": scheduler.get_last_lr()[0],
+            "train": train_stats,
+            "valid": valid_stats,
+            "valid_metrics": valid_metrics,
+            "selection_score": selection_score,
+            "selection_metric_used": metric_used,
+        }
         history.append(record)
-        monitor = valid_stats.get("loss", train_stats["loss"])
-        if monitor < best_valid_loss:
-            best_valid_loss = monitor
+        if selection_score > best_score + cfg.early_stopping_min_delta:
+            best_score = selection_score
+            best_epoch = epoch
+            best_metric_used = metric_used
+            epochs_without_improvement = 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        print(f"[epoch {epoch:03d}] train={train_stats['loss']:.6f} " f"valid={valid_stats.get('loss', float('nan')):.6f}")
+        else:
+            epochs_without_improvement += 1
+        print(
+            f"[epoch {epoch:03d}] train_loss={train_stats['loss']:.6f} "
+            f"valid_loss={valid_stats['loss']:.6f} "
+            f"valid_rankic={valid_metrics.get('mean_rankic', float('nan')):.6f} "
+            f"select={metric_used}:{selection_score:.6f}"
+        )
+        if epochs_without_improvement >= cfg.early_stopping_patience:
+            print(
+                f"[early stop] epoch={epoch}, best_epoch={best_epoch}, "
+                f"best_{best_metric_used}={best_score:.6f}"
+            )
+            break
 
-    # If no validation split exists, the best_state is the state from the first
-    # epoch under the generic monitor. For paper-style fixed-epoch training,
-    # use the final epoch explicitly.
-    if valid_loader is None:
-        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     if best_state is not None:
         model.load_state_dict(best_state)
 
@@ -1223,11 +1453,17 @@ def train_and_evaluate(
             "target_mean": target_mean,
             "target_std": target_std,
             "device_used": device,
+            "best_epoch": best_epoch,
+            "best_selection_metric": best_metric_used,
+            "best_selection_score": best_score,
         },
         checkpoint,
     )
     save_json({"history": history}, cfg.output_dir / "training_history.json")
 
+    valid_predictions = predict(model, valid_loader, device, target_mean, target_std)
+    valid_predictions.to_csv(cfg.output_dir / "valid_predictions.csv", index=False)
+    valid_prediction_metrics = evaluate_predictions(valid_predictions)
     test_predictions = predict(model, test_loader, device, target_mean, target_std)
     test_predictions.to_csv(cfg.output_dir / "test_predictions.csv", index=False)
     prediction_metrics = evaluate_predictions(test_predictions)
@@ -1235,17 +1471,27 @@ def train_and_evaluate(
     curve.to_csv(cfg.output_dir / "topk_backtest.csv", index=False)
     save_json(
         {
+            "run_summary": {
+                "best_epoch": best_epoch,
+                "selection_metric": best_metric_used,
+                "selection_score": best_score,
+                "split_summary": split_summary,
+            },
+            "validation_metrics": valid_prediction_metrics,
             "prediction_metrics": prediction_metrics,
             "backtest_metrics": backtest_metrics,
         },
         cfg.output_dir / "metrics.json",
     )
+    print("[validation metrics]")
+    print(json.dumps(valid_prediction_metrics, ensure_ascii=False, indent=2))
     print("[test metrics]")
     print(json.dumps(prediction_metrics, ensure_ascii=False, indent=2))
     print("[backtest metrics]")
     print(json.dumps(backtest_metrics, ensure_ascii=False, indent=2))
     return {
         "model": model,
+        "validation_metrics": valid_prediction_metrics,
         "prediction_metrics": prediction_metrics,
         "backtest_metrics": backtest_metrics,
         "history": history,
@@ -1262,7 +1508,29 @@ def load_cfg_from_args() -> Config:
     parser.add_argument("--mode", choices=["download", "prepare", "train", "all"], default="all")
     parser.add_argument("--max-stocks", type=int, default=None, help="调试时限制股票数量，例如 20")
     parser.add_argument("--epochs", type=int, default=None, help="覆盖默认训练轮数")
+    parser.add_argument("--batch-size", type=int, default=None, help="覆盖默认 batch size")
+    parser.add_argument("--learning-rate", type=float, default=None, help="覆盖默认学习率")
     parser.add_argument("--device", type=str, default=None, help="auto/cpu/cuda")
+    parser.add_argument(
+        "--selection-metric",
+        choices=["valid_loss", "valid_rankic"],
+        default=None,
+        help="保存最佳模型的验证指标",
+    )
+    parser.add_argument("--patience", type=int, default=None, help="早停耐心轮数")
+    parser.add_argument("--start-date", type=str, default=None, help="下载起始日 YYYYMMDD")
+    parser.add_argument("--end-date", type=str, default=None, help="下载结束日 YYYYMMDD")
+    parser.add_argument("--train-start", type=str, default=None)
+    parser.add_argument("--train-end", type=str, default=None)
+    parser.add_argument("--valid-start", type=str, default=None)
+    parser.add_argument("--valid-end", type=str, default=None)
+    parser.add_argument("--test-start", type=str, default=None)
+    parser.add_argument("--test-end", type=str, default=None)
+    parser.add_argument(
+        "--disable-cross-sectional-normalization",
+        action="store_true",
+        help="关闭按日去极值和截面标准化，用于消融比较",
+    )
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--force-rebuild-features", action="store_true")
     args = parser.parse_args()
@@ -1272,8 +1540,31 @@ def load_cfg_from_args() -> Config:
         cfg.max_stocks = args.max_stocks
     if args.epochs is not None:
         cfg.epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.learning_rate is not None:
+        cfg.learning_rate = args.learning_rate
     if args.device is not None:
         cfg.device = args.device
+    if args.selection_metric is not None:
+        cfg.selection_metric = args.selection_metric
+    if args.patience is not None:
+        cfg.early_stopping_patience = args.patience
+    for field_name in [
+        "start_date",
+        "end_date",
+        "train_start",
+        "train_end",
+        "valid_start",
+        "valid_end",
+        "test_start",
+        "test_end",
+    ]:
+        value = getattr(args, field_name)
+        if value is not None:
+            setattr(cfg, field_name, value)
+    if args.disable_cross_sectional_normalization:
+        cfg.cross_sectional_normalize = False
     if args.force_download:
         cfg.force_download = True
     if args.force_rebuild_features:

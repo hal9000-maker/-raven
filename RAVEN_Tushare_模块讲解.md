@@ -101,7 +101,7 @@ pip install tushare pandas numpy torch scikit-learn tqdm
 ### 4.1 先用 20 只股票做小样本测试
 
 ~~~bash
-python raven_tushare_reproduction.py --mode all --max-stocks 20 --epochs 3
+python raven_tushare_reproduction.py --mode all --max-stocks 20 --epochs 3 --force-download --force-rebuild-features
 ~~~
 
 这个命令会：
@@ -110,8 +110,9 @@ python raven_tushare_reproduction.py --mode all --max-stocks 20 --epochs 3
 2. 清洗数据；
 3. 构造因子；
 4. 构造序列样本；
-5. 训练 3 轮；
-6. 输出测试集指标和简单 Top-K 回测。
+5. 训练 3 轮，并输出验证集 Loss、RankIC；
+6. 根据验证集 RankIC 保存最佳模型；
+7. 输出验证集与测试集指标、简单 Top-K 回测。
 
 ### 4.2 只下载数据
 
@@ -220,6 +221,8 @@ raven_tushare_data/raw/daily_all.pkl
 ~~~
 
 这样再次运行时会优先使用缓存，不会每次重新消耗 Tushare 调用次数。
+
+缓存会记录指数、日期范围、股票数量和是否下载 `daily_basic`。其中任何一项改变，脚本会自动重新下载并重建因子；`--force-download` 也会同时让处理后的因子缓存失效，避免“配置已改、实际数据仍是旧年份”的错配。
 
 ### 5.4 可选 daily_basic
 
@@ -739,18 +742,19 @@ train_and_evaluate(cfg, factors, factor_cols)
 训练流程是：
 
 1. 构造 StockBlock；
-2. 按日期切分训练集和测试集；
+2. 按日期切分训练集、验证集和测试集，并 purge 跨标签边界的样本；
 3. 用训练集标签计算 target mean/std；
 4. 创建 Dataset 和 DataLoader；
 5. 初始化 RAVEN；
 6. 使用 AdamW；
 7. 使用 CosineAnnealingLR；
-8. 每个 epoch 计算 MSE、熵正则和多样性正则；
-9. 梯度裁剪；
-10. 保存模型和训练历史；
-11. 在测试集上生成预测。
+8. 每个 epoch 计算 MSE、熵正则、多样性正则和验证集 RankIC；
+9. 默认按验证集 RankIC 保存最佳模型，连续 10 轮没有改善则早停；
+10. 梯度裁剪；
+11. 保存模型、训练历史、验证集预测和测试集预测；
+12. 在测试集上做一次最终评估。
 
-论文使用 AdamW、60 epochs、余弦退火。脚本默认沿用这个设置。
+论文使用 AdamW、60 epochs、余弦退火。脚本默认沿用这个设置，并增加早停来避免无效训练。`metrics.json` 会写入最佳 epoch、模型选择指标、三段样本的日期与数量，以及验证集和测试集的 RankIC/ICIR。
 
 如果显存不够：
 

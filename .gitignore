@@ -1,0 +1,4 @@
+.runtime-packages/
+raven_tushare_data/
+__pycache__/
+*.py[cod]

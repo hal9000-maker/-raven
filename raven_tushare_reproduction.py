@@ -37,10 +37,10 @@ Quick start:
     4. Full run:
        python raven_tushare_reproduction.py --mode all
 
-The default local study split is:
-    train: 2023-01-01 to 2024-12-31
-    valid: 2025-01-01 to 2025-12-31
-    test : 2026-01-01 to 2026-12-31
+The paper-aligned study split is:
+    fit  : 2008-01-01 to 2018-12-31
+    valid: 2019-01-01 to 2019-12-31 (held out from fitting)
+    test : 2020-01-01 to 2024-12-31
 
 The 2026 test interval is evaluated only over dates returned by Tushare, so it
 is a partial-year out-of-sample period until the year is complete. Future-horizon
@@ -57,7 +57,7 @@ import pickle
 import random
 import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -71,22 +71,20 @@ import torch.nn as nn
 # 0. USER CONFIGURATION: READ TOKEN FROM LOCAL ENVIRONMENT
 # ============================================================================
 
-TUSHARE_TOKEN = "7a8351e69ce5153511ebad4e491a8970d78dd5d5feb4d340c7106a8a"
-FEATURE_CACHE_VERSION = 2
+FEATURE_CACHE_VERSION = 4
 
 
 @dataclass
 class Config:
     # ---- Data source ----
-    tushare_token: str = TUSHARE_TOKEN
     index_code: str = "000300.SH"
-    start_date: str = "20180101"
+    start_date: str = "20080101"
     end_date: str = "20241231"
-    train_start: str = "20180101"
-    train_end: str = "20211231"
-    valid_start: Optional[str] = "20220101"
-    valid_end: Optional[str] = "20221231"
-    test_start: str = "20230101"
+    train_start: str = "20090101"
+    train_end: str = "20191231"
+    valid_start: Optional[str] = "20190101"
+    valid_end: Optional[str] = "20191231"
+    test_start: str = "20200101"
     test_end: str = "20241231"
     min_listing_days: int = 180
     exclude_st: bool = True
@@ -137,6 +135,7 @@ class Config:
     rebalance_every: int = 10
     top_k: int = 30
     transaction_cost_bps: float = 10.0
+    backtest_holding_horizon: int = 10
 
     # ---- Optional operational controls ----
     force_download: bool = False
@@ -165,7 +164,7 @@ class Config:
         return (self.max_lookback // self.patch_len) * self.patch_len
 
     def validate(self) -> None:
-        if not self.tushare_token or "在这里" in self.tushare_token:
+        if not os.getenv("TUSHARE_TOKEN"):
             raise ValueError(
                 "请先在本地环境变量 TUSHARE_TOKEN 中填入你的 Tushare Token。"
             )
@@ -177,6 +176,12 @@ class Config:
             raise ValueError("thresholds 必须递增。")
         if self.patch_len <= 0 or self.max_lookback < self.patch_len:
             raise ValueError("max_lookback 必须不小于 patch_len。")
+        if self.embed_dim % 2 or self.embed_dim % self.num_heads:
+            raise ValueError("embed_dim 必须为偶数且能被 num_heads 整除。")
+        if self.forecast_horizon < 1 or self.rebalance_every < 1:
+            raise ValueError("forecast_horizon 和 rebalance_every 必须为正整数。")
+        if self.backtest_holding_horizon < 1:
+            raise ValueError("backtest_holding_horizon 必须为正整数。")
         if self.early_stopping_patience < 1:
             raise ValueError("early_stopping_patience 至少为 1。")
         if self.early_stopping_min_delta < 0:
@@ -196,8 +201,8 @@ class Config:
             raise ValueError("训练集和测试集起止日期不合法。")
         if valid_start is None or valid_end is None:
             raise ValueError("当前训练流程要求显式设置验证集日期。")
-        if valid_start > valid_end or not (train_end < valid_start <= valid_end < test_start):
-            raise ValueError("时间切分必须满足 train < valid < test，且各区间不能重叠。")
+        if valid_start > valid_end or not (train_start <= valid_start <= valid_end <= train_end < test_start):
+            raise ValueError("验证集必须是训练日期区间内的末段，且 train < test、日期不重叠。")
 
         data_start = pd.Timestamp(self.start_date)
         data_end = pd.Timestamp(self.end_date)
@@ -346,8 +351,11 @@ def create_tushare_api(cfg: Config):
         import tushare as ts
     except ImportError as exc:
         raise ImportError("请先运行 pip install tushare。") from exc
-    ts.set_token(cfg.tushare_token)
-    return ts.pro_api(cfg.tushare_token)
+    token = os.getenv("TUSHARE_TOKEN", "")
+    if not token:
+        raise ValueError("缺少环境变量 TUSHARE_TOKEN。")
+    ts.set_token(token)
+    return ts.pro_api(token)
 
 
 def tushare_call(cfg: Config, function, **kwargs) -> pd.DataFrame:
@@ -612,6 +620,10 @@ def clean_daily_data(
         name = df["name"].fillna("").astype(str)
         df = df[~name.str.contains(r"ST|退", case=False, regex=True)]
 
+    if "delist_date" in df.columns:
+        delist_dt = pd.to_datetime(df["delist_date"], format="%Y%m%d", errors="coerce")
+        df = df[delist_dt.isna() | (df["trade_date"] <= delist_dt)]
+
     if cfg.min_listing_days > 0 and "list_date" in df.columns:
         list_dt = pd.to_datetime(df["list_date"], format="%Y%m%d", errors="coerce")
         age = (df["trade_date"] - list_dt).dt.days
@@ -711,11 +723,26 @@ def construct_factors(cleaned: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame,
         out["log_close"] = log_close
         out = pd.concat([out, f], axis=1)
         out["future_log_return"] = log_close.shift(-cfg.forecast_horizon) - log_close
+        out["target_end_date"] = g["trade_date"].shift(-cfg.forecast_horizon)
         feature_frames.append(out)
 
     factors = pd.concat(feature_frames, ignore_index=True)
-    factor_cols = [c for c in factors.columns if c not in {"ts_code", "trade_date", "close", "log_close", "future_log_return"}]
+    factor_cols = [
+        c
+        for c in factors.columns
+        if c not in {
+            "ts_code",
+            "trade_date",
+            "close",
+            "log_close",
+            "future_log_return",
+            "target_end_date",
+        }
+    ]
     factors = factors.replace([np.inf, -np.inf], np.nan)
+    # Persist the actual H-step endpoint so split purging remains correct when
+    # a stock has missing or suspended trading dates in its downloaded series.
+    factors["target_end_date"] = pd.to_datetime(factors["target_end_date"], errors="coerce")
     factors = factors.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
     return factors, factor_cols
 
@@ -737,8 +764,9 @@ def cross_sectional_normalize_factors(
     q = cfg.winsorize_quantile
     for _, index in result.groupby("trade_date", sort=False).groups.items():
         values = result.loc[index, factor_cols]
-        lower = values.quantile(q)
-        upper = values.quantile(1.0 - q)
+        valid = values.notna()
+        lower = values.quantile(q).fillna(-np.inf)
+        upper = values.quantile(1.0 - q).fillna(np.inf)
         clipped = values.clip(lower=lower, upper=upper, axis=1)
         mean = clipped.mean(axis=0)
         std = clipped.std(axis=0, ddof=0).replace(0.0, np.nan)
@@ -749,10 +777,10 @@ def cross_sectional_normalize_factors(
         # enter the training samples too early.
         constant_cols = std[std.isna()].index.tolist()
         if constant_cols:
-            normalized.loc[:, constant_cols] = normalized.loc[:, constant_cols].where(
-                clipped.loc[:, constant_cols].isna(), 0.0
+            normalized.loc[:, constant_cols] = clipped.loc[:, constant_cols].where(
+                ~valid.loc[:, constant_cols], 0.0
             )
-        result.loc[index, factor_cols] = normalized.where(clipped.notna())
+        result.loc[index, factor_cols] = normalized.where(valid)
     return result
 
 
@@ -837,6 +865,7 @@ class StockBlock:
     X: np.ndarray
     y: np.ndarray
     close: np.ndarray
+    target_end_dates: np.ndarray
 
 
 @dataclass
@@ -885,10 +914,18 @@ def build_blocks(factors: pd.DataFrame, factor_cols: List[str]) -> List[StockBlo
     for code, g in factors.groupby("ts_code", sort=True):
         g = g.sort_values("trade_date").copy()
         X = g[factor_cols].to_numpy(dtype=np.float32)
+        # Cross-sectional normalization can leave warm-up NaNs for a factor
+        # unavailable on every name on that date; zero is the neutral value.
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         y = g["future_log_return"].to_numpy(dtype=np.float32)
         dates = g["trade_date"].to_numpy(dtype="datetime64[ns]")
         close = g["close"].to_numpy(dtype=np.float32)
-        blocks.append(StockBlock(str(code), dates, X, y, close))
+        target_end_dates = np.full(
+            len(g), np.datetime64("NaT", "ns"), dtype="datetime64[ns]"
+        )
+        if "target_end_date" in g.columns:
+            target_end_dates = pd.to_datetime(g["target_end_date"]).to_numpy(dtype="datetime64[ns]")
+        blocks.append(StockBlock(str(code), dates, X, y, close, target_end_dates))
     return blocks
 
 
@@ -922,10 +959,9 @@ def split_indices(
             # boundary. The target is formed with a row-based horizon within
             # each stock block, so use the corresponding future observation
             # date rather than a calendar-day approximation.
-            future_idx = end_idx + cfg.forecast_horizon
-            if future_idx >= len(block.dates):
+            future_date = pd.Timestamp(block.target_end_dates[end_idx])
+            if pd.isna(future_date):
                 continue
-            future_date = pd.Timestamp(block.dates[future_idx])
             sample = SampleIndex(block_id, end_idx)
 
             if (
@@ -940,7 +976,9 @@ def split_indices(
                 and future_date <= train_end
             ):
                 train_indices.append(sample)
-                train_targets.append(y)
+                # Keep validation labels out of the scaler and gradient fit.
+                if valid_start is None or date < valid_start:
+                    train_targets.append(y)
             elif (
                 test_start <= date <= test_end
                 and future_date <= test_end
@@ -1135,11 +1173,11 @@ class RAVEN(nn.Module):
         z_stack = torch.stack(expert_vectors, dim=1)  # [B, K, d]
 
         # Raw confidence alpha_k followed by correlation-aware redundancy decay.
-        alpha = F.softplus(self.alpha_head(z_stack).squeeze(-1)) + 1e-6
+        alpha = torch.sigmoid(self.alpha_head(z_stack).squeeze(-1)) + 1e-6
         normed = F.normalize(z_stack, dim=-1)
         cosine = torch.bmm(normed, normed.transpose(1, 2))
         eye = torch.eye(self.num_experts, device=x.device, dtype=x.dtype).unsqueeze(0)
-        redundancy = (F.relu(cosine) * (1.0 - eye)).sum(dim=-1)
+        redundancy = (cosine * (1.0 - eye)).sum(dim=-1)
         lambda_red = F.softplus(self.raw_lambda)
         local_weights = F.softmax(torch.log(alpha) - lambda_red * redundancy, dim=1)
         z_local = (local_weights.unsqueeze(-1) * z_stack).sum(dim=1)
@@ -1173,7 +1211,8 @@ def raven_loss(prediction, target, aux, cfg: Config):
     cosine = aux["expert_cosine"]
     k = cosine.shape[-1]
     eye = torch.eye(k, device=cosine.device, dtype=cosine.dtype).unsqueeze(0)
-    diversity_penalty = ((cosine - eye) ** 2).mean()
+    off_diagonal = 1.0 - eye
+    diversity_penalty = (((cosine - eye) ** 2) * off_diagonal).sum(dim=(1, 2)).mean()
     total = (
         mse
         + cfg.lambda_entropy * entropy_penalty
@@ -1272,24 +1311,54 @@ def evaluate_predictions(predictions: pd.DataFrame) -> Dict[str, float]:
         "mae_normalized": float(np.mean(np.abs(df["pred_norm"] - df["true_norm"]))),
     }
 
-    daily_ics: List[float] = []
-    daily_rankics: List[float] = []
+    daily_ics: List[Tuple[pd.Timestamp, float]] = []
+    daily_rankics: List[Tuple[pd.Timestamp, float]] = []
     for _, group in df.groupby("trade_date"):
         if len(group) < 3:
             continue
-        daily_ics.append(safe_corr(group["pred_return"], group["true_return"], "pearson"))
-        daily_rankics.append(safe_corr(group["pred_return"], group["true_return"], "spearman"))
-    daily_ics = [x for x in daily_ics if np.isfinite(x)]
-    daily_rankics = [x for x in daily_rankics if np.isfinite(x)]
-    if daily_ics:
-        metrics["mean_daily_ic"] = float(np.mean(daily_ics))
-        metrics["icir"] = float(np.mean(daily_ics) / (np.std(daily_ics, ddof=1) + 1e-12))
-        metrics["positive_ic_ratio"] = float(np.mean(np.asarray(daily_ics) > 0))
-    if daily_rankics:
-        metrics["mean_rankic"] = float(np.mean(daily_rankics))
-        metrics["rankicir"] = float(np.mean(daily_rankics) / (np.std(daily_rankics, ddof=1) + 1e-12))
-        metrics["positive_rankic_ratio"] = float(np.mean(np.asarray(daily_rankics) > 0))
+        date = pd.Timestamp(group["trade_date"].iloc[0])
+        daily_ics.append((date, safe_corr(group["pred_return"], group["true_return"], "pearson")))
+        daily_rankics.append((date, safe_corr(group["pred_return"], group["true_return"], "spearman")))
+    # The paper defines ICIR across 10-trading-day rebalancing periods.
+    # Sampling non-overlapping date buckets avoids treating overlapping daily
+    # H-day labels as independent observations.
+    def rebalance_period_values(items):
+        valid = [(date, value) for date, value in items if np.isfinite(value)]
+        return [
+            float(np.mean([value for _, value in valid[i : i + 10]]))
+            for i in range(0, len(valid), 10)
+            if valid[i : i + 10]
+        ]
+
+    daily_ic_values = [x for _, x in daily_ics if np.isfinite(x)]
+    daily_rankic_values = [x for _, x in daily_rankics if np.isfinite(x)]
+    period_ics = rebalance_period_values(daily_ics)
+    period_rankics = rebalance_period_values(daily_rankics)
+    if daily_ic_values:
+        metrics["mean_daily_ic"] = float(np.mean(daily_ic_values))
+        metrics["positive_ic_ratio"] = float(np.mean(np.asarray(daily_ic_values) > 0))
+    if daily_rankic_values:
+        metrics["mean_rankic"] = float(np.mean(daily_rankic_values))
+        metrics["positive_rankic_ratio"] = float(np.mean(np.asarray(daily_rankic_values) > 0))
+    if period_ics:
+        metrics["mean_rebalance_ic"] = float(np.mean(period_ics))
+        metrics["icir"] = float(np.mean(period_ics) / (np.std(period_ics, ddof=1) + 1e-12)) if len(period_ics) > 1 else float("nan")
+    if period_rankics:
+        metrics["mean_rebalance_rankic"] = float(np.mean(period_rankics))
+        metrics["rankicir"] = float(np.mean(period_rankics) / (np.std(period_rankics, ddof=1) + 1e-12)) if len(period_rankics) > 1 else float("nan")
     return metrics
+
+
+def evaluate_by_period(predictions: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """Report annual metrics and an overall multi-year summary."""
+    df = predictions.copy()
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    result = {
+        str(year): evaluate_predictions(group)
+        for year, group in df.groupby(df["trade_date"].dt.year, sort=True)
+    }
+    result["overall"] = evaluate_predictions(df)
+    return result
 
 
 def validation_selection_score(
@@ -1307,10 +1376,10 @@ def validation_selection_score(
 
 
 def simple_topk_backtest(predictions: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """A transparent top-K backtest using the paper's 10-day rebalance idea.
+    """A transparent approximation of the paper's 10-day top-K strategy.
 
     This is intentionally simpler than Qlib's full simulator. It uses the
-    realized H-day target return, equal weights the top-K names, charges a
+    realized H-day cumulative log-return, equal weights the top-K names, charges a
     configurable turnover cost, and reports a cumulative equity curve.
     """
 
@@ -1327,7 +1396,8 @@ def simple_topk_backtest(predictions: pd.DataFrame, cfg: Config) -> Tuple[pd.Dat
         selected = day.sort_values("pred_return", ascending=False).head(cfg.top_k)
         holdings = set(selected["ts_code"].astype(str))
         turnover = 1.0 if not prev_holdings else 1.0 - len(holdings & prev_holdings) / max(len(holdings), 1)
-        gross_return = float(selected["true_return"].mean())
+        # Convert each H-day cumulative log return to a simple holding return.
+        gross_return = float(np.expm1(selected["true_return"].clip(-20.0, 20.0)).mean())
         cost = turnover * cfg.transaction_cost_bps / 10000.0
         net_return = gross_return - cost
         rows.append(
@@ -1367,229 +1437,3 @@ def simple_topk_backtest(predictions: pd.DataFrame, cfg: Config) -> Tuple[pd.Dat
 
 
 def train_and_evaluate(
-    cfg: Config,
-    factors: pd.DataFrame,
-    factor_cols: List[str],
-) -> Dict[str, Any]:
-    import torch
-
-    set_seed(cfg.seed)
-    device = choose_device(cfg)
-    print(f"[train] device={device}, effective_lookback={cfg.effective_lookback}, patches={cfg.effective_lookback // cfg.patch_len}")
-
-    blocks = build_blocks(factors, factor_cols)
-    train_idx, valid_idx, test_idx, target_mean, target_std = split_indices(blocks, cfg)
-    split_summary = {
-        "train": summarize_split(blocks, train_idx),
-        "valid": summarize_split(blocks, valid_idx),
-        "test": summarize_split(blocks, test_idx),
-    }
-    print(f"[split detail] {json.dumps(split_summary, ensure_ascii=False)}")
-    train_ds = RavenSequenceDataset(blocks, train_idx, cfg.effective_lookback, target_mean, target_std)
-    valid_ds = RavenSequenceDataset(blocks, valid_idx, cfg.effective_lookback, target_mean, target_std)
-    test_ds = RavenSequenceDataset(blocks, test_idx, cfg.effective_lookback, target_mean, target_std)
-
-    train_loader = make_loader(train_ds, cfg, shuffle=True)
-    valid_loader = make_loader(valid_ds, cfg, shuffle=False)
-    test_loader = make_loader(test_ds, cfg, shuffle=False)
-
-    model = RAVEN(num_channels=len(factor_cols), cfg=cfg).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
-
-    best_state = None
-    best_score = -float("inf")
-    best_epoch = 0
-    best_metric_used = cfg.selection_metric
-    epochs_without_improvement = 0
-    history: List[Dict[str, Any]] = []
-    for epoch in range(1, cfg.epochs + 1):
-        train_stats = run_epoch(model, train_loader, optimizer, device, cfg, train=True)
-        valid_stats = run_epoch(model, valid_loader, None, device, cfg, train=False)
-        valid_predictions = predict(model, valid_loader, device, target_mean, target_std)
-        valid_metrics = evaluate_predictions(valid_predictions)
-        selection_score, metric_used = validation_selection_score(cfg, valid_stats, valid_metrics)
-        scheduler.step()
-        record = {
-            "epoch": epoch,
-            "lr": scheduler.get_last_lr()[0],
-            "train": train_stats,
-            "valid": valid_stats,
-            "valid_metrics": valid_metrics,
-            "selection_score": selection_score,
-            "selection_metric_used": metric_used,
-        }
-        history.append(record)
-        if selection_score > best_score + cfg.early_stopping_min_delta:
-            best_score = selection_score
-            best_epoch = epoch
-            best_metric_used = metric_used
-            epochs_without_improvement = 0
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            epochs_without_improvement += 1
-        print(
-            f"[epoch {epoch:03d}] train_loss={train_stats['loss']:.6f} "
-            f"valid_loss={valid_stats['loss']:.6f} "
-            f"valid_rankic={valid_metrics.get('mean_rankic', float('nan')):.6f} "
-            f"select={metric_used}:{selection_score:.6f}"
-        )
-        if epochs_without_improvement >= cfg.early_stopping_patience:
-            print(
-                f"[early stop] epoch={epoch}, best_epoch={best_epoch}, "
-                f"best_{best_metric_used}={best_score:.6f}"
-            )
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    checkpoint = cfg.output_dir / "raven_model.pt"
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "config": asdict(cfg),
-            "factor_cols": factor_cols,
-            "target_mean": target_mean,
-            "target_std": target_std,
-            "device_used": device,
-            "best_epoch": best_epoch,
-            "best_selection_metric": best_metric_used,
-            "best_selection_score": best_score,
-        },
-        checkpoint,
-    )
-    save_json({"history": history}, cfg.output_dir / "training_history.json")
-
-    valid_predictions = predict(model, valid_loader, device, target_mean, target_std)
-    valid_predictions.to_csv(cfg.output_dir / "valid_predictions.csv", index=False)
-    valid_prediction_metrics = evaluate_predictions(valid_predictions)
-    test_predictions = predict(model, test_loader, device, target_mean, target_std)
-    test_predictions.to_csv(cfg.output_dir / "test_predictions.csv", index=False)
-    prediction_metrics = evaluate_predictions(test_predictions)
-    curve, backtest_metrics = simple_topk_backtest(test_predictions, cfg)
-    curve.to_csv(cfg.output_dir / "topk_backtest.csv", index=False)
-    save_json(
-        {
-            "run_summary": {
-                "best_epoch": best_epoch,
-                "selection_metric": best_metric_used,
-                "selection_score": best_score,
-                "split_summary": split_summary,
-            },
-            "validation_metrics": valid_prediction_metrics,
-            "prediction_metrics": prediction_metrics,
-            "backtest_metrics": backtest_metrics,
-        },
-        cfg.output_dir / "metrics.json",
-    )
-    print("[validation metrics]")
-    print(json.dumps(valid_prediction_metrics, ensure_ascii=False, indent=2))
-    print("[test metrics]")
-    print(json.dumps(prediction_metrics, ensure_ascii=False, indent=2))
-    print("[backtest metrics]")
-    print(json.dumps(backtest_metrics, ensure_ascii=False, indent=2))
-    return {
-        "model": model,
-        "validation_metrics": valid_prediction_metrics,
-        "prediction_metrics": prediction_metrics,
-        "backtest_metrics": backtest_metrics,
-        "history": history,
-    }
-
-
-# ============================================================================
-# 7. COMMAND LINE ENTRYPOINT
-# ============================================================================
-
-
-def load_cfg_from_args() -> Config:
-    parser = argparse.ArgumentParser(description="Tushare-based RAVEN reproduction")
-    parser.add_argument("--mode", choices=["download", "prepare", "train", "all"], default="all")
-    parser.add_argument("--max-stocks", type=int, default=None, help="调试时限制股票数量，例如 20")
-    parser.add_argument("--epochs", type=int, default=None, help="覆盖默认训练轮数")
-    parser.add_argument("--batch-size", type=int, default=None, help="覆盖默认 batch size")
-    parser.add_argument("--learning-rate", type=float, default=None, help="覆盖默认学习率")
-    parser.add_argument("--device", type=str, default=None, help="auto/cpu/cuda")
-    parser.add_argument(
-        "--selection-metric",
-        choices=["valid_loss", "valid_rankic"],
-        default=None,
-        help="保存最佳模型的验证指标",
-    )
-    parser.add_argument("--patience", type=int, default=None, help="早停耐心轮数")
-    parser.add_argument("--start-date", type=str, default=None, help="下载起始日 YYYYMMDD")
-    parser.add_argument("--end-date", type=str, default=None, help="下载结束日 YYYYMMDD")
-    parser.add_argument("--train-start", type=str, default=None)
-    parser.add_argument("--train-end", type=str, default=None)
-    parser.add_argument("--valid-start", type=str, default=None)
-    parser.add_argument("--valid-end", type=str, default=None)
-    parser.add_argument("--test-start", type=str, default=None)
-    parser.add_argument("--test-end", type=str, default=None)
-    parser.add_argument(
-        "--disable-cross-sectional-normalization",
-        action="store_true",
-        help="关闭按日去极值和截面标准化，用于消融比较",
-    )
-    parser.add_argument("--force-download", action="store_true")
-    parser.add_argument("--force-rebuild-features", action="store_true")
-    args = parser.parse_args()
-
-    cfg = Config()
-    if args.max_stocks is not None:
-        cfg.max_stocks = args.max_stocks
-    if args.epochs is not None:
-        cfg.epochs = args.epochs
-    if args.batch_size is not None:
-        cfg.batch_size = args.batch_size
-    if args.learning_rate is not None:
-        cfg.learning_rate = args.learning_rate
-    if args.device is not None:
-        cfg.device = args.device
-    if args.selection_metric is not None:
-        cfg.selection_metric = args.selection_metric
-    if args.patience is not None:
-        cfg.early_stopping_patience = args.patience
-    for field_name in [
-        "start_date",
-        "end_date",
-        "train_start",
-        "train_end",
-        "valid_start",
-        "valid_end",
-        "test_start",
-        "test_end",
-    ]:
-        value = getattr(args, field_name)
-        if value is not None:
-            setattr(cfg, field_name, value)
-    if args.disable_cross_sectional_normalization:
-        cfg.cross_sectional_normalize = False
-    if args.force_download:
-        cfg.force_download = True
-    if args.force_rebuild_features:
-        cfg.force_rebuild_features = True
-    return cfg, args.mode
-
-
-def main() -> None:
-    cfg, mode = load_cfg_from_args()
-    cfg.validate()
-    ensure_dirs(cfg)
-    save_json(asdict(cfg), cfg.root / "config_snapshot.json")
-
-    if mode == "download":
-        download_market_data(cfg)
-        return
-
-    factors, factor_cols = prepare_features(cfg)
-    if mode == "prepare":
-        print(f"[prepare done] {len(factors):,} rows, {len(factor_cols)} factor columns")
-        return
-
-    if mode in {"train", "all"}:
-        train_and_evaluate(cfg, factors, factor_cols)
-
-
-if __name__ == "__main__":
-    main()

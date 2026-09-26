@@ -80,14 +80,14 @@ class Config:
     # ---- Data source ----
     tushare_token: str = TUSHARE_TOKEN
     index_code: str = "000300.SH"
-    start_date: str = "20230101"
-    end_date: str = "20261231"
-    train_start: str = "20230101"
-    train_end: str = "20241231"
-    valid_start: Optional[str] = "20250101"
-    valid_end: Optional[str] = "20251231"
-    test_start: str = "20260101"
-    test_end: str = "20261231"
+    start_date: str = "20180101"
+    end_date: str = "20241231"
+    train_start: str = "20180101"
+    train_end: str = "20211231"
+    valid_start: Optional[str] = "20220101"
+    valid_end: Optional[str] = "20221231"
+    test_start: str = "20230101"
+    test_end: str = "20241231"
     min_listing_days: int = 180
     exclude_st: bool = True
     download_daily_basic: bool = False

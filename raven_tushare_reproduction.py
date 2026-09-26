@@ -71,7 +71,7 @@ import torch.nn as nn
 # 0. USER CONFIGURATION: READ TOKEN FROM LOCAL ENVIRONMENT
 # ============================================================================
 
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+TUSHARE_TOKEN = "7a8351e69ce5153511ebad4e491a8970d78dd5d5feb4d340c7106a8a"
 FEATURE_CACHE_VERSION = 2
 
 

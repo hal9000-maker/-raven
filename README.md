@@ -16,3 +16,14 @@ Install dependencies with `pip install -r requirements.txt`, then run a small en
 
 ```powershell
 python raven_tushare_reproduction.py --mode all --max-stocks 20 --epochs 3
+```
+
+For the paper's HS300 evaluation window, run with full history (2008 warm-up; train 2009–2019, validation 2019, test 2020–2024):
+
+```powershell
+python raven_tushare_reproduction.py --mode all
+```
+
+The 2019 calendar year is the held-out validation subset and is excluded from gradient fitting and target scaling. The test window follows the paper. Tushare access, historical membership permissions, and local compute determine whether the full run is feasible.
+
+See [RAVEN_Tushare_模块讲解.md](RAVEN_Tushare_模块讲解.md) for methodology, limitations, and outputs.

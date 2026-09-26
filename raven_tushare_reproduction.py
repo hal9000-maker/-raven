@@ -1437,3 +1437,233 @@ def simple_topk_backtest(predictions: pd.DataFrame, cfg: Config) -> Tuple[pd.Dat
 
 
 def train_and_evaluate(
+    cfg: Config,
+    factors: pd.DataFrame,
+    factor_cols: List[str],
+) -> Dict[str, Any]:
+    import torch
+
+    set_seed(cfg.seed)
+    device = choose_device(cfg)
+    print(f"[train] device={device}, effective_lookback={cfg.effective_lookback}, patches={cfg.effective_lookback // cfg.patch_len}")
+
+    blocks = build_blocks(factors, factor_cols)
+    train_idx, valid_idx, test_idx, target_mean, target_std = split_indices(blocks, cfg)
+    split_summary = {
+        "train": summarize_split(blocks, train_idx),
+        "valid": summarize_split(blocks, valid_idx),
+        "test": summarize_split(blocks, test_idx),
+    }
+    print(f"[split detail] {json.dumps(split_summary, ensure_ascii=False)}")
+    train_ds = RavenSequenceDataset(blocks, train_idx, cfg.effective_lookback, target_mean, target_std)
+    valid_ds = RavenSequenceDataset(blocks, valid_idx, cfg.effective_lookback, target_mean, target_std)
+    test_ds = RavenSequenceDataset(blocks, test_idx, cfg.effective_lookback, target_mean, target_std)
+
+    train_loader = make_loader(train_ds, cfg, shuffle=True)
+    valid_loader = make_loader(valid_ds, cfg, shuffle=False)
+    test_loader = make_loader(test_ds, cfg, shuffle=False)
+
+    model = RAVEN(num_channels=len(factor_cols), cfg=cfg).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+
+    best_state = None
+    best_score = -float("inf")
+    best_epoch = 0
+    best_metric_used = cfg.selection_metric
+    epochs_without_improvement = 0
+    history: List[Dict[str, Any]] = []
+    for epoch in range(1, cfg.epochs + 1):
+        train_stats = run_epoch(model, train_loader, optimizer, device, cfg, train=True)
+        valid_stats = run_epoch(model, valid_loader, None, device, cfg, train=False)
+        valid_predictions = predict(model, valid_loader, device, target_mean, target_std)
+        valid_metrics = evaluate_predictions(valid_predictions)
+        selection_score, metric_used = validation_selection_score(cfg, valid_stats, valid_metrics)
+        scheduler.step()
+        record = {
+            "epoch": epoch,
+            "lr": scheduler.get_last_lr()[0],
+            "train": train_stats,
+            "valid": valid_stats,
+            "valid_metrics": valid_metrics,
+            "selection_score": selection_score,
+            "selection_metric_used": metric_used,
+        }
+        history.append(record)
+        if selection_score > best_score + cfg.early_stopping_min_delta:
+            best_score = selection_score
+            best_epoch = epoch
+            best_metric_used = metric_used
+            epochs_without_improvement = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            epochs_without_improvement += 1
+        print(
+            f"[epoch {epoch:03d}] train_loss={train_stats['loss']:.6f} "
+            f"valid_loss={valid_stats['loss']:.6f} "
+            f"valid_rankic={valid_metrics.get('mean_rankic', float('nan')):.6f} "
+            f"select={metric_used}:{selection_score:.6f}"
+        )
+        if epochs_without_improvement >= cfg.early_stopping_patience:
+            print(
+                f"[early stop] epoch={epoch}, best_epoch={best_epoch}, "
+                f"best_{best_metric_used}={best_score:.6f}"
+            )
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    checkpoint = cfg.output_dir / "raven_model.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "config": asdict(cfg),
+            "factor_cols": factor_cols,
+            "target_mean": target_mean,
+            "target_std": target_std,
+            "device_used": device,
+            "best_epoch": best_epoch,
+            "best_selection_metric": best_metric_used,
+            "best_selection_score": best_score,
+        },
+        checkpoint,
+    )
+    save_json({"history": history}, cfg.output_dir / "training_history.json")
+
+    valid_predictions = predict(model, valid_loader, device, target_mean, target_std)
+    valid_predictions.to_csv(cfg.output_dir / "valid_predictions.csv", index=False)
+    valid_prediction_metrics = evaluate_predictions(valid_predictions)
+    test_predictions = predict(model, test_loader, device, target_mean, target_std)
+    test_predictions.to_csv(cfg.output_dir / "test_predictions.csv", index=False)
+    prediction_metrics = evaluate_predictions(test_predictions)
+    annual_metrics = evaluate_by_period(test_predictions)
+    curve, backtest_metrics = simple_topk_backtest(test_predictions, cfg)
+    curve.to_csv(cfg.output_dir / "topk_backtest.csv", index=False)
+    save_json(
+        {
+            "run_summary": {
+                "best_epoch": best_epoch,
+                "selection_metric": best_metric_used,
+                "selection_score": best_score,
+                "split_summary": split_summary,
+            },
+            "validation_metrics": valid_prediction_metrics,
+            "prediction_metrics": prediction_metrics,
+            "annual_metrics": annual_metrics,
+            "backtest_metrics": backtest_metrics,
+        },
+        cfg.output_dir / "metrics.json",
+    )
+    print("[validation metrics]")
+    print(json.dumps(valid_prediction_metrics, ensure_ascii=False, indent=2))
+    print("[test metrics]")
+    print(json.dumps(prediction_metrics, ensure_ascii=False, indent=2))
+    print("[annual test metrics]")
+    print(json.dumps(annual_metrics, ensure_ascii=False, indent=2))
+    print("[backtest metrics]")
+    print(json.dumps(backtest_metrics, ensure_ascii=False, indent=2))
+    return {
+        "model": model,
+        "validation_metrics": valid_prediction_metrics,
+        "prediction_metrics": prediction_metrics,
+        "backtest_metrics": backtest_metrics,
+        "history": history,
+    }
+
+
+# ============================================================================
+# 7. COMMAND LINE ENTRYPOINT
+# ============================================================================
+
+
+def load_cfg_from_args() -> Config:
+    parser = argparse.ArgumentParser(description="Tushare-based RAVEN reproduction")
+    parser.add_argument("--mode", choices=["download", "prepare", "train", "all"], default="all")
+    parser.add_argument("--max-stocks", type=int, default=None, help="调试时限制股票数量，例如 20")
+    parser.add_argument("--epochs", type=int, default=None, help="覆盖默认训练轮数")
+    parser.add_argument("--batch-size", type=int, default=None, help="覆盖默认 batch size")
+    parser.add_argument("--learning-rate", type=float, default=None, help="覆盖默认学习率")
+    parser.add_argument("--device", type=str, default=None, help="auto/cpu/cuda")
+    parser.add_argument(
+        "--selection-metric",
+        choices=["valid_loss", "valid_rankic"],
+        default=None,
+        help="保存最佳模型的验证指标",
+    )
+    parser.add_argument("--patience", type=int, default=None, help="早停耐心轮数")
+    parser.add_argument("--start-date", type=str, default=None, help="下载起始日 YYYYMMDD")
+    parser.add_argument("--end-date", type=str, default=None, help="下载结束日 YYYYMMDD")
+    parser.add_argument("--train-start", type=str, default=None)
+    parser.add_argument("--train-end", type=str, default=None)
+    parser.add_argument("--valid-start", type=str, default=None)
+    parser.add_argument("--valid-end", type=str, default=None)
+    parser.add_argument("--test-start", type=str, default=None)
+    parser.add_argument("--test-end", type=str, default=None)
+    parser.add_argument(
+        "--disable-cross-sectional-normalization",
+        action="store_true",
+        help="关闭按日去极值和截面标准化，用于消融比较",
+    )
+    parser.add_argument("--force-download", action="store_true")
+    parser.add_argument("--force-rebuild-features", action="store_true")
+    args = parser.parse_args()
+
+    cfg = Config()
+    if args.max_stocks is not None:
+        cfg.max_stocks = args.max_stocks
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.learning_rate is not None:
+        cfg.learning_rate = args.learning_rate
+    if args.device is not None:
+        cfg.device = args.device
+    if args.selection_metric is not None:
+        cfg.selection_metric = args.selection_metric
+    if args.patience is not None:
+        cfg.early_stopping_patience = args.patience
+    for field_name in [
+        "start_date",
+        "end_date",
+        "train_start",
+        "train_end",
+        "valid_start",
+        "valid_end",
+        "test_start",
+        "test_end",
+    ]:
+        value = getattr(args, field_name)
+        if value is not None:
+            setattr(cfg, field_name, value)
+    if args.disable_cross_sectional_normalization:
+        cfg.cross_sectional_normalize = False
+    if args.force_download:
+        cfg.force_download = True
+    if args.force_rebuild_features:
+        cfg.force_rebuild_features = True
+    return cfg, args.mode
+
+
+def main() -> None:
+    cfg, mode = load_cfg_from_args()
+    cfg.validate()
+    ensure_dirs(cfg)
+    save_json(asdict(cfg), cfg.root / "config_snapshot.json")
+
+    if mode == "download":
+        download_market_data(cfg)
+        return
+
+    factors, factor_cols = prepare_features(cfg)
+    if mode == "prepare":
+        print(f"[prepare done] {len(factors):,} rows, {len(factor_cols)} factor columns")
+        return
+
+    if mode in {"train", "all"}:
+        train_and_evaluate(cfg, factors, factor_cols)
+
+
+if __name__ == "__main__":
+    main()

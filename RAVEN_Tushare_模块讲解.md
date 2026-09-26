@@ -698,3 +698,328 @@ L = L_MSE + λ_ent * L_ent + λ_div * L_div
 ~~~python
 F.mse_loss(prediction, target)
 ~~~
+
+训练标签先使用训练集均值和标准差标准化，这样 MSE 更容易优化。Pearson、RankIC 和回测仍使用恢复尺度后的原始收益率。
+
+### 10.2 路由熵正则
+
+~~~python
+L_ent = sum(p * log(p))
+~~~
+
+它的作用是防止重要性分布过于尖锐。
+
+如果没有它，最近 Patch 可能快速获得几乎全部权重，导致：
+
+~~~text
+短期、中期、长期窗口都变成同一个短窗口
+~~~
+
+### 10.3 专家多样性正则
+
+~~~python
+L_div = ||R - I||²
+~~~
+
+其中 R 是专家表示的余弦相似度矩阵。
+
+它鼓励不同专家学习互补表示，而不是三个专家都输出几乎相同的向量。
+
+---
+
+## 11. 训练流程
+
+训练函数：
+
+~~~python
+train_and_evaluate(cfg, factors, factor_cols)
+~~~
+
+训练流程是：
+
+1. 构造 StockBlock；
+2. 按日期切分训练集、验证集和测试集，并 purge 跨标签边界的样本；
+3. 用训练集标签计算 target mean/std；
+4. 创建 Dataset 和 DataLoader；
+5. 初始化 RAVEN；
+6. 使用 AdamW；
+7. 使用 CosineAnnealingLR；
+8. 每个 epoch 计算 MSE、熵正则、多样性正则和验证集 RankIC；
+9. 默认按验证集 RankIC 保存最佳模型，连续 10 轮没有改善则早停；
+10. 梯度裁剪；
+11. 保存模型、训练历史、验证集预测和测试集预测；
+12. 在测试集上做一次最终评估。
+
+论文使用 AdamW、60 epochs、余弦退火。脚本默认沿用这个设置，并增加早停来避免无效训练。`metrics.json` 会写入最佳 epoch、模型选择指标、三段样本的日期与数量，以及验证集和测试集的 RankIC/ICIR。
+
+如果显存不够：
+
+~~~python
+batch_size = 128
+~~~
+
+正式训练可以进一步改造成带 padding mask 的完全向量化版本。
+
+---
+
+## 12. 评估指标
+
+函数：
+
+~~~python
+evaluate_predictions(predictions)
+~~~
+
+脚本输出：
+
+### 12.1 Pearson Corr
+
+所有样本预测收益和真实收益之间的 Pearson 相关系数。
+
+### 12.2 MSE / MAE
+
+使用标准化后的预测和标签计算，便于与论文中的 MSE 数值比较。
+
+### 12.3 每日 IC
+
+对每个交易日的股票截面计算：
+
+~~~text
+预测收益 vs 真实未来收益
+~~~
+
+得到每日 IC。
+
+### 12.4 RankIC
+
+对预测值和真实值分别排名后计算 Spearman 相关系数。
+
+这更接近你的选股目标。
+
+### 12.5 ICIR / RankICIR
+
+脚本先计算逐日截面 IC。论文 ICIR 按十日调仓期报告；当前日频近似实现按日计算，年化频率不乘平方根：
+
+~~~text
+ICIR = mean(IC) / std(IC)
+~~~
+
+没有额外乘以平方根频率。
+
+同时输出：
+
+- 正 IC 比例；
+- 正 RankIC 比例。
+
+---
+
+## 13. Top-K 简单回测
+
+函数：
+
+~~~python
+simple_topk_backtest(predictions, cfg)
+~~~
+
+默认设置：
+
+~~~text
+每 10 个交易日调仓
+选预测值最高的 30 只股票
+等权持有
+按照股票集合变化计算换手
+按照 transaction_cost_bps 扣交易成本
+~~~
+
+它输出：
+
+- 总收益；
+- 年化收益；
+- 近似 Sharpe；
+- 最大回撤；
+- 平均换手率；
+- 调仓次数。
+
+这只是透明的研究级回测，不等价于 Qlib 的完整撮合模拟，也没有模拟：
+
+- 涨跌停；
+- 停牌无法成交；
+- 开盘/收盘撮合细节；
+- 冲击成本曲线；
+- 容量约束；
+- 行业和风格暴露约束。
+
+正式研究时应把预测输出接入你自己的组合优化和真实成本模块。
+
+---
+
+## 14. 输出文件
+
+运行后主要得到：
+
+~~~text
+raven_tushare_data/
+├── raw/
+│   ├── stock_basic.pkl
+│   ├── hs300_members.pkl
+│   ├── daily_all.pkl
+│   └── daily/
+├── processed/
+│   ├── cleaned_daily.pkl
+│   ├── features.pkl
+│   └── feature_names.json
+└── outputs/
+    ├── raven_model.pt
+    ├── training_history.json
+    ├── test_predictions.csv
+    ├── topk_backtest.csv
+    └── metrics.json
+~~~
+
+---
+
+## 15. 与论文完全一致和不完全一致的地方
+
+### 已实现的核心结构
+
+- Instance Normalization；
+- Channel-independent Patch Embedding；
+- 反向时间 Patch 顺序；
+- Patch importance scoring；
+- CIT 动态连续前缀窗口；
+- 短期、中期、长期独立 Transformer 专家；
+- Shape-aligned average pooling；
+- CAW 相关性感知融合；
+- GCR 全局压缩表示；
+- MSE + entropy + diversity loss；
+- HS300 日频收益预测；
+- 2020–2024 年论文对应的样本外测试期；
+- ICIR 和 Top-K 回测。
+
+### 无法完全恢复的地方
+
+1. 论文没有公开完整私有因子清单；
+2. 论文正文没有给出全部数据下载和清洗细节；
+3. 论文没有完全公开训练随机种子、学习率等所有细节；
+4. 表格中的部分基线实现和预处理细节无法仅凭论文复原；
+5. 论文使用 Qlib 的完整模拟器，脚本中的 Top-K 回测是透明简化版；
+6. 论文的 alpha_k 原始专家置信度具体实现没有完全展开，脚本用可学习的 alpha_head 实现；
+7. 论文的 CIT 公式存在阈值边界解释空间，脚本使用“累计重要性首次达到阈值”的实际实现。
+
+因此，脚本适合作为：
+
+~~~text
+论文方法复现
++ 可执行的 Tushare 数据管线
++ 可审计的因子工程
++ 可迁移到 Level2 的模型骨架
+~~~
+
+而不是宣称可以逐位恢复作者的内部生产代码。
+
+---
+
+## 16. 如何改成你的 Level2 / 分钟级版本
+
+你现在的研究目标是 Level2/逐笔成交聚合到分钟级、预测未来约 3 分钟收益。改造重点如下。
+
+### 16.1 替换数据下载层
+
+保留 RAVEN 模型和 Dataset，只替换：
+
+~~~python
+download_market_data()
+clean_daily_data()
+construct_factors()
+~~~
+
+输入改成：
+
+~~~text
+[分钟, 订单流/盘口/成交结构因子]
+~~~
+
+例如：
+
+- OBI；
+- OFI；
+- 主动买卖成交；
+- 撤单率；
+- 盘口深度；
+- Spread；
+- 价量冲击；
+- 集合竞价因子；
+- 订单流共振；
+- 短期波动和流动性因子。
+
+### 16.2 重新设置时间尺度
+
+论文中的 120 日和 16 日 Patch 不能直接搬到分钟数据。
+
+你需要根据未来 3 分钟的预测目标，用 rolling OOS 比较不同设置，例如：
+
+~~~text
+max_lookback = 60 / 120 / 240 根分钟
+patch_len = 4 / 8 / 16 根分钟
+~~~
+
+最终不能只看训练 MSE，要看：
+
+- RankIC；
+- ICIR；
+- 月度 IC 同号率；
+- IC Decay；
+- Top-K / Bottom-K；
+- 换手率；
+- breakeven cost；
+- 扣成本收益；
+- 跨股票和跨月份稳定性。
+
+### 16.3 改损失函数
+
+论文是收益回归，因此默认 MSE。
+
+你的主要目标是排序，可以增加：
+
+~~~text
+L = MSE + λ_rank * RankLoss + λ_ent * Lent + λ_div * Ldiv
+~~~
+
+并用验证集 RankIC 或成本后 Top-K 表现选择模型，而不是只看 MSE。
+
+### 16.4 严格避免泄漏
+
+Level2 场景必须特别检查：
+
+1. 因子滚动窗口只能使用当前时点以前的数据；
+2. 标准化参数不能使用未来区间；
+3. 标签窗口和训练窗口之间要做 purge；
+4. 训练、验证、测试必须按时间切分；
+5. 不要用测试集来确定 Patch 长度、专家数量或阈值；
+6. 训练后的最终测试只能做一次。
+
+---
+
+## 17. 推荐的实际使用顺序
+
+~~~text
+第一步：20只股票、3个epoch，确认脚本能跑通
+第二步：100只股票、5~10个epoch，检查损失和路由长度
+第三步：完整HS300、60个epoch
+第四步：查看 patch_prob 和 expert_weights 是否塌缩
+第五步：做去掉 CAW、去掉 GCR、去掉动态路由的消融
+第六步：比较 RankIC、ICIR、分组收益、成本后收益
+第七步：再迁移到你的 Level2 分钟数据
+~~~
+
+尤其要检查：
+
+~~~text
+patch_prob 是否总是集中在最近一个 Patch
+三个专家的长度是否几乎完全相同
+三个专家的余弦相似度是否接近 1
+专家权重是否长期只由某一个专家占据
+~~~
+
+如果出现这些情况，说明发生了路由塌缩或专家表示塌缩，需要调整熵正则、学习率、Dropout、Patch 长度或专家数量。
+
